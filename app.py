@@ -1,5 +1,8 @@
 import re
 import difflib
+import threading
+import time
+import os
 from functools import lru_cache
 from urllib.parse import unquote, quote_plus
 
@@ -282,5 +285,21 @@ def watch():
 
     return jsonify({"title": title, "video_url": video_url})
 
+# ----------------- RESTART LOGIC -----------------
+def restart_server():
+    """Restarts the server by exiting the process."""
+    # Convert 4 hours to seconds (4 * 60 * 60)
+    RESTART_INTERVAL = 14400 
+    while True:
+        print(f"Restarting server in {RESTART_INTERVAL} seconds...")
+        time.sleep(RESTART_INTERVAL)
+        print("Initiating server restart...")
+        # This will exit the process, which a process manager will detect and restart.
+        os._exit(0)
+
 if __name__ == "__main__":
+    # Start the background thread for the restart timer
+    restart_thread = threading.Thread(target=restart_server, daemon=True)
+    restart_thread.start()
+    
     app.run(host="0.0.0.0", port=5000)
