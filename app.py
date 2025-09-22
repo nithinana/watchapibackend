@@ -287,15 +287,29 @@ def watch():
 
 # ----------------- RESTART LOGIC -----------------
 def restart_server():
-    """Restarts the server by exiting the process."""
-    # Convert 4 hours to seconds (4 * 60 * 60)
-    RESTART_INTERVAL = 14400 
-    while True:
-        print(f"Restarting server in {RESTART_INTERVAL} seconds...")
-        time.sleep(RESTART_INTERVAL)
-        print("Initiating server restart...")
-        # This will exit the process, which a process manager will detect and restart.
-        os._exit(0)
+    """Restarts the server by sending a shutdown request."""
+    # Convert 3 hours to seconds (3 * 60 * 60)
+    RESTART_INTERVAL = 10800
+    time.sleep(RESTART_INTERVAL)
+    print("Initiating server restart...")
+    try:
+        # Assuming the app is running on localhost:5000.
+        # This will trigger the /shutdown route
+        requests.get("http://127.0.0.1:5000/shutdown?token=YOUR_SECRET_TOKEN")
+    except requests.exceptions.ConnectionError:
+        print("Server is already shut down.")
+
+@app.route('/shutdown', methods=['GET'])
+def shutdown():
+    token = request.args.get('token')
+    # You should set a real, secure token in an environment variable.
+    if token != "YOUR_SECRET_TOKEN":
+        return "Unauthorized", 403
+
+    shutdown_func = request.environ.get('werkzeug.server.shutdown')
+    if shutdown_func is not None:
+        shutdown_func()
+    return "Server shutting down...", 200
 
 if __name__ == "__main__":
     # Start the background thread for the restart timer
