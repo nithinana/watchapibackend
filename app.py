@@ -286,40 +286,19 @@ def watch():
     return jsonify({"title": title, "video_url": video_url})
 
 # ----------------- RESTART LOGIC -----------------
-
-# Set a secure token in an environment variable for production
-# SHUTDOWN_TOKEN = os.environ.get("SHUTDOWN_TOKEN", "YOUR_SECRET_TOKEN")
-SHUTDOWN_TOKEN = "YOUR_SECRET_TOKEN"
-
 def restart_server():
-    """Restarts the server by sending a shutdown request."""
-    # Convert 3 hours to seconds (3 * 60 * 60)
-    RESTART_INTERVAL = 10800
-    print(f"Server will shut down in {RESTART_INTERVAL} seconds...")
-    time.sleep(RESTART_INTERVAL)
-    print("Initiating server shutdown...")
-    try:
-        # The shutdown request is made to the local server
-        requests.get(f"http://127.0.0.1:5000/shutdown?token={SHUTDOWN_TOKEN}")
-    except requests.exceptions.ConnectionError:
-        print("Server is already shut down.")
-
-@app.route('/shutdown', methods=['GET'])
-def shutdown():
-    token = request.args.get('token')
-    if token != SHUTDOWN_TOKEN:
-        print("Unauthorized shutdown attempt.")
-        return "Unauthorized", 403
-
-    shutdown_func = request.environ.get('werkzeug.server.shutdown')
-    if shutdown_func:
-        shutdown_func()
-        print("Server is shutting down now.")
-    return "Server shutting down...", 200
+    """Restarts the server by exiting the process."""
+    # Convert 4 hours to seconds (4 * 60 * 60)
+    RESTART_INTERVAL = 14400 
+    while True:
+        print(f"Restarting server in {RESTART_INTERVAL} seconds...")
+        time.sleep(RESTART_INTERVAL)
+        print("Initiating server restart...")
+        # This will exit the process, which a process manager will detect and restart.
+        os._exit(0)
 
 if __name__ == "__main__":
     # Start the background thread for the restart timer
-    # Setting daemon=True ensures the thread is killed when the main process exits
     restart_thread = threading.Thread(target=restart_server, daemon=True)
     restart_thread.start()
     
