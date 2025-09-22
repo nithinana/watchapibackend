@@ -61,8 +61,11 @@ TITLE_PATTERNS = [
 ]
 
 # --- CACHE CONFIG ---
-fetch_page_cache = TTLCache(maxsize=256, ttl=432000)
-search_movie_cache = TTLCache(maxsize=128, ttl=432000)
+# IMPROVEMENT: For faster parsing, install lxml: pip install lxml
+fetch_page_cache = TTLCache(maxsize=256, ttl=432000)      # 5 days for raw pages
+search_movie_cache = TTLCache(maxsize=128, ttl=432000)     # 5 days for search results
+# NEW: Added 1-hour cache for individual movie data (title & video URL).
+movie_data_cache = TTLCache(maxsize=128, ttl=3600)         # 1 hour for parsed movie data
 
 # ----------------- HELPERS -----------------
 @cached(cache=TTLCache(maxsize=128, ttl=86400))
@@ -124,11 +127,14 @@ def try_extract_title_from_dom(soup: BeautifulSoup) -> str | None:
             return cleaned
     return None
 
+# IMPROVEMENT: Caching the parsed title to avoid re-parsing HTML for 1 hour.
+@cached(cache=movie_data_cache)
 def get_title_from_movie_page(page_url: str) -> str | None:
     content = fetch_page(page_url)
     if not content:
         return None
-    soup = BeautifulSoup(content, 'html.parser')
+    # IMPROVEMENT: Use lxml for much faster HTML parsing.
+    soup = BeautifulSoup(content, 'lxml')
     return try_extract_title_from_dom(soup)
 
 def process_movie_block(div) -> dict | None:
@@ -173,7 +179,8 @@ def fetch_movies_by_url(url: str) -> list[dict]:
     content = fetch_page(url)
     if not content:
         return []
-    soup = BeautifulSoup(content, 'html.parser')
+    # IMPROVEMENT: Use lxml for much faster HTML parsing.
+    soup = BeautifulSoup(content, 'lxml')
     blocks = soup.find_all('div', class_='block1')
     movies = []
     for b in blocks:
@@ -190,14 +197,16 @@ def search_movie(language: str, movie_title: str) -> list[dict]:
     url = f"https://einthusan.tv/movie/results/?lang={lang_code}&query={quote_plus(movie_title)}"
     return fetch_movies_by_url(url)
 
-# --- NEW: Add a try-except block for robust error handling ---
+# IMPROVEMENT: Caching the parsed video URL to avoid re-parsing HTML for 1 hour.
+@cached(cache=movie_data_cache)
 def extract_video_url(page_url: str) -> str | None:
     content = fetch_page(page_url)
     if not content:
         return None
     
     try:
-        soup = BeautifulSoup(content, 'html.parser')
+        # IMPROVEMENT: Use lxml for much faster HTML parsing.
+        soup = BeautifulSoup(content, 'lxml')
         player = soup.find(id="UIVideoPlayer")
         if player:
             mp4_link = player.get('data-mp4-link')
@@ -271,13 +280,15 @@ def watch():
     if movie_title_from_url:
         title = unquote(movie_title_from_url)
     else:
+        # This call is now cached for 1 hour
         title = get_title_from_movie_page(movie_url)
         if title:
             title = clean_title(title)
 
     if not title or looks_like_code(title):
         title = "Unknown"
-
+    
+    # This call is now cached for 1 hour
     video_url = extract_video_url(movie_url)
     
     if not video_url:
