@@ -42,12 +42,7 @@ SESSION.headers.update({
 
 REQUEST_TIMEOUT = 8  # seconds
 
-# UPDATED: We're adding a new, more comprehensive pattern to handle
-# the "language in HD - Einthusan" case more effectively, and re-ordering
-# the patterns to ensure the most specific ones are checked first.
 TITLE_PATTERNS = [
-    # This new pattern is designed to catch the language, quality, and site name
-    # in various formats, with or without a year.
     (re.compile(r'\s*\(\d{4}\)\s*(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
     (re.compile(r'\s*\(\d{4}\)\s*(?:(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*(?:,)?\s*)+\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
     (re.compile(r'\s*(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
@@ -61,8 +56,13 @@ TITLE_PATTERNS = [
 ]
 
 # --- CACHE CONFIG ---
+# Create a TTLCache with a 10-minute (600 seconds) expiration time
+# This cache will store fetched pages to avoid repeated requests to the same URL.
 fetch_page_cache = TTLCache(maxsize=256, ttl=432000)
-search_movie_cache = TTLCache(maxsize=128, ttl=432000)
+
+# Create a TTLCache specifically for movie video URLs.
+# Each entry will be removed from the cache after 10 minutes.
+video_url_cache = TTLCache(maxsize=512, ttl=600)
 
 # ----------------- HELPERS -----------------
 @cached(cache=TTLCache(maxsize=128, ttl=86400))
@@ -168,6 +168,14 @@ def process_movie_block(div) -> dict | None:
 
     return {"title": title, "img_url": img_url, "page_url": page_url_full}
 
+@cached(cache=TTLCache(maxsize=128, ttl=432000))
+def search_movie(language: str, movie_title: str) -> list[dict]:
+    lang_code = LANGUAGE_CODES.get(language.lower())
+    if not lang_code:
+        return []
+    url = f"https://einthusan.tv/movie/results/?lang={lang_code}&query={quote_plus(movie_title)}"
+    return fetch_movies_by_url(url)
+
 @cached(cache=fetch_page_cache)
 def fetch_movies_by_url(url: str) -> list[dict]:
     content = fetch_page(url)
@@ -182,15 +190,8 @@ def fetch_movies_by_url(url: str) -> list[dict]:
             movies.append(item)
     return movies
 
-@cached(cache=search_movie_cache)
-def search_movie(language: str, movie_title: str) -> list[dict]:
-    lang_code = LANGUAGE_CODES.get(language.lower())
-    if not lang_code:
-        return []
-    url = f"https://einthusan.tv/movie/results/?lang={lang_code}&query={quote_plus(movie_title)}"
-    return fetch_movies_by_url(url)
-
-# --- NEW: Add a try-except block for robust error handling ---
+# Apply the new video_url_cache to this function
+@cached(cache=video_url_cache)
 def extract_video_url(page_url: str) -> str | None:
     content = fetch_page(page_url)
     if not content:
@@ -213,12 +214,7 @@ def extract_video_url(page_url: str) -> str | None:
 # ----------------- ROUTES -----------------
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "service": "thirai-api", "endpoints": [
-        "/language/<language>?category=popular|recent&page=1",
-        "/search/<language>?q=QUERY",
-        "/watch?url=<encoded_movie_page_url>",
-        "/healthz"
-    ]})
+    return "ok", 200
 
 @app.get("/healthz")
 def healthz():
@@ -226,38 +222,28 @@ def healthz():
 
 @app.get("/language/<language>")
 def language_page(language):
-    category = request.args.get("category", "recent").lower()
-    page = request.args.get("page", 1, type=int)
-
     corrected = correct_spelling(language)
     if not corrected:
-        return jsonify({"error": "Invalid language"}), 400
-
-    lang_code = LANGUAGE_CODES[corrected]
-    if category == "popular":
-        url = f"https://einthusan.tv/movie/results/?find=Popularity&lang={lang_code}&ptype=view&tp=alltime&page={page}"
-    else:  # recent (default)
-        url = f"https://einthusan.tv/movie/results/?find=Recent&lang={lang_code}&page={page}"
-
-    movies = fetch_movies_by_url(url)
-    return jsonify({
-        "language": corrected,
-        "category": category,
-        "page": page,
-        "movies": movies,
-        "next_page": page + 1,
-        "has_more": len(movies) > 0
-    })
+        return jsonify({"error": "Language not found"}), 404
+    
+    page_url = f"https://einthusan.tv/movie/browse/?lang={corrected}"
+    
+    movies = fetch_movies_by_url(page_url)
+    
+    return jsonify({"language": corrected, "movies": movies})
 
 @app.get("/search/<language>")
 def search_route(language):
     q = request.args.get("q", "").strip()
     if not q:
-        return jsonify({"error": "Query parameter 'q' is required"}), 400
+        return jsonify({"error": "Missing query parameter"}), 400
+    
     corrected = correct_spelling(language)
     if not corrected:
-        return jsonify({"error": "Invalid language"}), 400
+        return jsonify({"error": "Language not found"}), 404
+
     results = search_movie(corrected, q)
+
     return jsonify({"language": corrected, "q": q, "movies": results})
 
 @app.get("/watch")
