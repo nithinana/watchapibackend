@@ -1,291 +1,66 @@
-import re
-import difflib
-import threading
-import time
-import os
-from functools import lru_cache
-from urllib.parse import unquote, quote_plus
+import eventlet
+import socketio
 
-import requests
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+# Initialize Socket.io server
+sio = socketio.Server(cors_allowed_origins='*')
+app = socketio.WSGIApp(sio)
 
-from cachetools import cached, TTLCache
+# Room storage: { room_id: { host_id, movie_url, users: [] } }
+rooms = {}
 
-app = Flask(__name__)
+@sio.event
+def connect(sid, environ):
+    print(f"User connected: {sid}")
 
-# CORS: allow all origins by default (or lock down to your GH Pages origin later)
-CORS(app)
-
-# ----------------- CONFIG -----------------
-LANGUAGE_CODES = {
-    "tamil": "tamil",
-    "hindi": "hindi",
-    "telugu": "telugu",
-    "malayalam": "malayalam",
-    "kannada": "kannada",
-    "bengali": "bengali",
-    "marathi": "marathi",
-    "punjabi": "punjabi",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-})
-
-REQUEST_TIMEOUT = 8  # seconds
-
-TITLE_PATTERNS = [
-    (re.compile(r'\s*\(\d{4}\)\s*(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
-    (re.compile(r'\s*\(\d{4}\)\s*(?:(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*(?:,)?\s*)+\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
-    (re.compile(r'\s*(?:Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\s*in\s*(?:HD|SD)\s*-\s*Einthusan.*$', re.IGNORECASE), ''),
-    (re.compile(r'^Einthusan\s*[-–—]\s*', re.IGNORECASE), ''),
-    (re.compile(r'\s*\(\d{4}\)\s*$'), ''),
-    (re.compile(r'\s*\[(Tamil|Hindi|Telugu|Malayalam|Kannada|Bengali|Marathi|Punjabi)\]', re.IGNORECASE), ''),
-    (re.compile(r'\|\s*Einthusan.*$', re.IGNORECASE), ''),
-    (re.compile(r'Watch Full Movie Online Free$', re.IGNORECASE), ''),
-    (re.compile(r'Online Watch Free (?:HD|SD)$', re.IGNORECASE), ''),
-    (re.compile(r'Free Movies Online$', re.IGNORECASE), ''),
-]
-
-# --- CACHE CONFIG ---
-# Create a TTLCache with a 10-minute (600 seconds) expiration time
-# This cache will store fetched pages to avoid repeated requests to the same URL.
-fetch_page_cache = TTLCache(maxsize=256, ttl=432000)
-
-# Create a TTLCache specifically for movie video URLs.
-# Each entry will be removed from the cache after 10 minutes.
-video_url_cache = TTLCache(maxsize=512, ttl=600)
-
-# ----------------- HELPERS -----------------
-@cached(cache=TTLCache(maxsize=128, ttl=86400))
-def correct_spelling(user_input: str):
-    """Fuzzy match a language key."""
-    options = tuple(LANGUAGE_CODES.keys())
-    match = difflib.get_close_matches((user_input or "").lower(), options, n=1, cutoff=0.7)
-    return match[0] if match else None
-
-def clean_title(title: str | None) -> str | None:
-    if not title:
-        return None
-    title = title.strip()
-    for pattern, repl in TITLE_PATTERNS:
-        title = pattern.sub(repl, title)
-    return title.strip()
-
-def looks_like_code(s: str | None) -> bool:
-    """Detect short alphanumeric codes like '53BA', '1S2Q', 'MukD' etc.
-    This version correctly ignores titles that are purely numbers, like "96"."""
-    if not s:
-        return False
-    s2 = s.strip()
-    if not s2:
-        return False
-    if s2.isdigit():
-        return False
-    one_token = len(s2.split()) == 1
-    simple = re.fullmatch(r'[A-Za-z0-9]+', s2) is not None
-    shortish = 2 <= len(s2) <= 8
-    has_digit = any(ch.isdigit() for ch in s2)
-    alpha = ''.join(ch for ch in s2 if ch.isalpha())
-    no_vowel = not re.search(r'[AEIOUaeiou]', alpha) if alpha else False
-    return one_token and simple and shortish and (has_digit or no_vowel)
-
-@cached(cache=fetch_page_cache)
-def fetch_page(url: str) -> bytes | None:
-    try:
-        resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.content
-    except requests.RequestException:
-        return None
-
-def try_extract_title_from_dom(soup: BeautifulSoup) -> str | None:
-    meta = soup.find('meta', property='og:title')
-    if meta and meta.get('content'):
-        cleaned = clean_title(meta['content'])
-        if cleaned:
-            return cleaned
-    if soup.title and soup.title.text:
-        cleaned = clean_title(soup.title.text)
-        if cleaned:
-            return cleaned
-    h1 = soup.find('h1')
-    if h1 and h1.text:
-        cleaned = clean_title(h1.text)
-        if cleaned:
-            return cleaned
-    return None
-
-def get_title_from_movie_page(page_url: str) -> str | None:
-    content = fetch_page(page_url)
-    if not content:
-        return None
-    soup = BeautifulSoup(content, 'html.parser')
-    return try_extract_title_from_dom(soup)
-
-def process_movie_block(div) -> dict | None:
-    a = div.find('a')
-    img = div.find('img')
-    title_div = div.find('div', class_='title')
-    if not (a and img):
-        return None
-
-    page_url_full = f"https://einthusan.tv{a.get('href','')}"
-
-    candidates = []
-    if title_div and title_div.text:
-        candidates.append(title_div.text.strip())
-    if img and img.get('alt'):
-        candidates.append(img.get('alt').strip())
-    if img and img.get('title'):
-        candidates.append(img.get('title').strip())
-
-    title = None
-    for c in candidates:
-        cleaned = clean_title(c)
-        if cleaned and len(cleaned) > 2 and not cleaned.isdigit():
-            title = cleaned
-            break
-
-    if not title or len(title) < 3 or looks_like_code(title):
-        t = get_title_from_movie_page(page_url_full)
-        if t:
-            title = t
-        else:
-            title = "Untitled Movie"
-
-    img_url = img.get('src') or img.get('data-src') or img.get('data-original') or ''
-    if img_url.startswith('//'):
-        img_url = 'https:' + img_url
-
-    return {"title": title, "img_url": img_url, "page_url": page_url_full}
-
-@cached(cache=TTLCache(maxsize=128, ttl=432000))
-def search_movie(language: str, movie_title: str) -> list[dict]:
-    lang_code = LANGUAGE_CODES.get(language.lower())
-    if not lang_code:
-        return []
-    url = f"https://einthusan.tv/movie/results/?lang={lang_code}&query={quote_plus(movie_title)}"
-    return fetch_movies_by_url(url)
-
-@cached(cache=fetch_page_cache)
-def fetch_movies_by_url(url: str) -> list[dict]:
-    content = fetch_page(url)
-    if not content:
-        return []
-    soup = BeautifulSoup(content, 'html.parser')
-    blocks = soup.find_all('div', class_='block1')
-    movies = []
-    for b in blocks:
-        item = process_movie_block(b)
-        if item:
-            movies.append(item)
-    return movies
-
-# Apply the new video_url_cache to this function
-@cached(cache=video_url_cache)
-def extract_video_url(page_url: str) -> str | None:
-    content = fetch_page(page_url)
-    if not content:
-        return None
+@sio.on('create-room')
+def on_create(sid, data):
+    room_id = data['roomId']
+    host_name = data['hostName']
+    movie_url = data['movieUrl']
     
-    try:
-        soup = BeautifulSoup(content, 'html.parser')
-        player = soup.find(id="UIVideoPlayer")
-        if player:
-            mp4_link = player.get('data-mp4-link')
-            if mp4_link and "etv" in mp4_link:
-                tail = mp4_link.split("etv", 1)[1]
-                return f"https://cdn1.einthusan.io/etv{tail}"
-    except Exception as e:
-        print(f"Error extracting video URL from {page_url}: {e}")
-        return None
+    sio.enter_room(sid, room_id)
+    rooms[room_id] = {
+        'host': sid,
+        'movieUrl': movie_url,
+        'users': [{'id': sid, 'name': host_name}]
+    }
+    sio.emit('room-created', room_id, room=sid)
+    print(f"Room {room_id} created by {host_name}")
+
+@sio.on('join-room')
+def on_join(sid, data):
+    room_id = data['roomId']
+    user_name = data['userName']
     
-    return None
-
-# ----------------- ROUTES -----------------
-@app.get("/")
-def root():
-    return "ok", 200
-
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
-
-@app.get("/language/<language>")
-def language_page(language):
-    corrected = correct_spelling(language)
-    if not corrected:
-        return jsonify({"error": "Language not found"}), 404
-    
-    page_url = f"https://einthusan.tv/movie/browse/?lang={corrected}"
-    
-    movies = fetch_movies_by_url(page_url)
-    
-    return jsonify({"language": corrected, "movies": movies})
-
-@app.get("/search/<language>")
-def search_route(language):
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"error": "Missing query parameter"}), 400
-    
-    corrected = correct_spelling(language)
-    if not corrected:
-        return jsonify({"error": "Language not found"}), 404
-
-    results = search_movie(corrected, q)
-
-    return jsonify({"language": corrected, "q": q, "movies": results})
-
-@app.get("/watch")
-def watch():
-    movie_url = request.args.get("url", "").strip()
-    movie_title_from_url = request.args.get("title", "").strip()
-
-    if not movie_url:
-        return jsonify({"error": "Movie URL missing"}), 400
-
-    if movie_title_from_url:
-        title = unquote(movie_title_from_url)
+    if room_id in rooms:
+        sio.enter_room(sid, room_id)
+        rooms[room_id]['users'].append({'id': sid, 'name': user_name})
+        # Notify room of updated user list
+        sio.emit('user-list', rooms[room_id]['users'], room=room_id)
+        # Send current movie info to joiner
+        sio.emit('joined-room', {'movieUrl': rooms[room_id]['movieUrl']}, room=sid)
     else:
-        title = get_title_from_movie_page(movie_url)
-        if title:
-            title = clean_title(title)
+        sio.emit('error', 'Room not found', room=sid)
 
-    if not title or looks_like_code(title):
-        title = "Unknown"
+@sio.on('sync-video')
+def on_sync(sid, data):
+    room_id = data['roomId']
+    if room_id in rooms and rooms[room_id]['host'] == sid:
+        # Broadcast host's state to everyone else in the room
+        sio.emit('video-update', {
+            'state': data['state'],
+            'time': data['time']
+        }, room=room_id, skip_sid=sid)
 
-    video_url = extract_video_url(movie_url)
-    
-    if not video_url:
-        return jsonify({"error": "Failed to extract video URL from the page."}), 500
+@sio.on('stop-party')
+def on_stop(sid, room_id):
+    if room_id in rooms and rooms[room_id]['host'] == sid:
+        sio.emit('party-ended', room=room_id)
+        del rooms[room_id]
 
-    return jsonify({"title": title, "video_url": video_url})
+@sio.event
+def disconnect(sid):
+    print(f"User disconnected: {sid}")
 
-# ----------------- RESTART LOGIC -----------------
-def restart_server():
-    """Restarts the server by exiting the process."""
-    # Convert 4 hours to seconds (4 * 60 * 60)
-    RESTART_INTERVAL = 14400 
-    while True:
-        print(f"Restarting server in {RESTART_INTERVAL} seconds...")
-        time.sleep(RESTART_INTERVAL)
-        print("Initiating server restart...")
-        # This will exit the process, which a process manager will detect and restart.
-        os._exit(0)
-
-if __name__ == "__main__":
-    # Start the background thread for the restart timer
-    restart_thread = threading.Thread(target=restart_server, daemon=True)
-    restart_thread.start()
-    
-    app.run(host="0.0.0.0", port=5000)
+if __name__ == '__main__':
+    eventlet.wsgi.server(eventlet.listen(('', 3000)), app)
